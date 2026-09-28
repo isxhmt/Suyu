@@ -10,52 +10,90 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 3
     steps:
-      - name: Read preinstalled Xcode only
+      - name: Inspect identified Xcode model frameworks
         shell: bash
         run: |
           python3 -I - <<'PY'
-          import json, mmap, os, pathlib, plistlib, re, subprocess, time
-          from urllib.parse import urlsplit
+          import hashlib, json, os, pathlib, plistlib, re, struct, subprocess, time
+          from urllib.parse import urlsplit, parse_qs
           
           def emit(kind, **data):
               print(json.dumps({"kind": kind, **data}, ensure_ascii=True), flush=True)
           
+          def macho_sections(data):
+              fat = {b"\xca\xfe\xba\xbe": (">", False), b"\xbe\xba\xfe\xca": ("<", False),
+                     b"\xca\xfe\xba\xbf": (">", True), b"\xbf\xba\xfe\xca": ("<", True)}
+              base = 0
+              if data[:4] in fat:
+                  endian, wide = fat[data[:4]]
+                  count = struct.unpack_from(endian + "I", data, 4)[0]
+                  if count > 20:
+                      raise ValueError("Unexpected FAT architecture count")
+                  architectures = []
+                  for i in range(count):
+                      entry = struct.unpack_from(endian + ("iiQQII" if wide else "iiIII"),
+                                                 data, 8 + i * (32 if wide else 20))
+                      cpu, _, offset, size = entry[:4]
+                      if offset + size > len(data):
+                          raise ValueError("Invalid FAT slice")
+                      architectures.append((cpu != 0x0100000C, offset))
+                  base = min(architectures)[1]
+              magic = data[base:base + 4]
+              if magic not in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"):
+                  raise ValueError("Not a 64-bit Mach-O image")
+              endian = "<" if magic == b"\xcf\xfa\xed\xfe" else ">"
+              ncmds, command_bytes = struct.unpack_from(endian + "II", data, base + 16)
+              pos, stop = base + 32, base + 32 + command_bytes
+              if ncmds > 10000 or stop > len(data):
+                  raise ValueError("Invalid load commands")
+              sections = []
+              for _ in range(ncmds):
+                  cmd, size = struct.unpack_from(endian + "II", data, pos)
+                  if size < 8 or pos + size > stop:
+                      raise ValueError("Invalid load command size")
+                  if cmd == 0x19:
+                      count = struct.unpack_from(endian + "I", data, pos + 64)[0]
+                      if 72 + count * 80 > size:
+                          raise ValueError("Invalid section list")
+                      for j in range(count):
+                          at = pos + 72 + j * 80
+                          section = data[at:at + 16].split(b"\0")[0].decode("ascii")
+                          segment = data[at + 16:at + 32].split(b"\0")[0].decode("ascii")
+                          address, length, offset = struct.unpack_from(endian + "QQI", data, at + 32)
+                          if section in ("__cstring", "__swift5_reflstr", "__ustring"):
+                              start = base + offset
+                              if start + length > len(data):
+                                  raise ValueError("Invalid string section bounds")
+                              sections.append((segment, section, start, length, address))
+                  pos += size
+              return sections
+          
           url_rx = re.compile(r"https?://[^\s\"'<>\\]{4,256}")
-          signal_rx = re.compile(r"chatgpt|openai|apple-relay|authclient|oauth|client[_-]?id|"
-                                 r"originator|backend-api|/responses|response\.create|text/event-stream", re.I)
-          client_rx = re.compile(r"^app_[A-Za-z0-9_-]{8,100}$")
-          patterns = [(re.compile(rb"[\x20-\x7e]{6,384}"), "ascii"),
-                      (re.compile(rb"(?:[\x20-\x7e]\x00){6,384}"), "utf-16le")]
-          
-          def clean_url(value):
-              try:
-                  p = urlsplit(value.rstrip("),.;"))
-                  if not p.hostname:
+          signal = re.compile(r"chatgpt|openai|floodgate|oauth|client.?id|redirect|authoriz|"
+                              r"bearer|scope|audience|responses|chat/completions|"
+                              r"api.?key|token|x-apple|x-openai|originator|attest|anonymous", re.I)
+          secret = re.compile(r"(?i)\b(?:sk[-_]|gh[pousr]_)[A-Za-z0-9_-]{12,}|\beyJ[A-Za-z0-9_.-]{40,}")
+          public_id = re.compile(r"^(?:app_[A-Za-z0-9_-]{8,100}|[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12})$")
+          def safe_text(text):
+              def clean(m):
+                  try:
+                      p = urlsplit(m.group().rstrip("),.;"))
+                      host = p.hostname or ""
+                      if ":" in host:
+                          host = "[" + host + "]"
+                      if p.port is not None:
+                          host += ":" + str(p.port)
+                      result = p.scheme + "://" + host + p.path
+                      public = {k: v for k, v in parse_qs(p.query).items()
+                                if k in ("client_id", "redirect_uri", "response_type", "scope", "audience")}
+                      if public:
+                          result += " [public_oauth=" + json.dumps(public, sort_keys=True) + "]"
+                      return result
+                  except ValueError:
                       return "[invalid-url]"
-                  host = f"[{p.hostname}]" if ":" in p.hostname else p.hostname
-                  if p.port is not None:
-                      host += f":{p.port}"
-                  return f"{p.scheme}://{host}{p.path}"
-              except ValueError:
-                  return "[invalid-url]"
-          
-          def scan(data, deadline):
-              found, other = set(), set()
-              for pattern, encoding in patterns:
-                  for item in pattern.finditer(data):
-                      if time.monotonic() > deadline:
-                          return found | other, True
-                      text = item.group().decode(encoding, errors="ignore")
-                      for url in url_rx.findall(text):
-                          target = found if signal_rx.search(url) else other
-                          if target is found or len(other) < 50:
-                              target.add(("url", clean_url(url)))
-                      if signal_rx.search(text) or client_rx.fullmatch(text):
-                          text = url_rx.sub(lambda m: clean_url(m.group()), text)
-                          found.add(("protocol_string", text[:240]))
-                      if len(found) >= 500:
-                          return found | other, True
-              return found | other, False
+              text = secret.sub("[redacted]", text)
+              text = url_rx.sub(clean, text)
+              return text[:360]
           
           started = time.monotonic()
           selected = os.environ.get("DEVELOPER_DIR") or subprocess.check_output(
@@ -63,85 +101,67 @@ jobs:
           selected = pathlib.Path(selected).resolve()
           app = next((p for p in (selected, *selected.parents) if p.suffix == ".app"), None)
           if not app or app.parent != pathlib.Path("/Applications") or not app.name.startswith("Xcode"):
-              raise SystemExit("Selected developer directory is not an /Applications/Xcode*.app")
+              raise SystemExit("Expected a preinstalled Xcode app")
           info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
-          version = str(info.get("CFBundleShortVersionString", ""))
-          if not version.split(".")[0].isdigit() or int(version.split(".")[0]) < 26:
-              raise SystemExit("Xcode 26 or newer is required")
-          emit("xcode", path=str(app), version=version,
-               bundle_id=info.get("CFBundleIdentifier"), build=info.get("ProductBuildVersion"))
-          deadline = time.monotonic() + 75
-          name_rx = re.compile(r"intelligence|codingassistant|assistant|chat|openai|codex|"
-                               r"idefoundation|devtoolscore|dvtfoundation", re.I)
-          specific_rx = re.compile(r"intelligence|codingassistant|chat|openai|codex", re.I)
-          roots = ["PlugIns", "SharedFrameworks", "Frameworks",
-                   "Developer/Library/Xcode/Plug-ins", "Developer/Library/PrivateFrameworks",
-                   "Developer/Library/Frameworks"]
-          bundles, visited = set(), 0
-          for relative in roots:
-              for current, dirs, files in os.walk(app / "Contents" / relative, followlinks=False):
-                  visited += 1
-                  dirs[:] = sorted(d for d in dirs if not d.endswith((".lproj", ".dSYM")))
-                  p = pathlib.Path(current)
-                  if p.suffix in (".framework", ".ideplugin", ".bundle", ".xpc") and name_rx.search(p.name):
-                      bundles.add(p)
-                  if visited >= 3000 or time.monotonic() > deadline:
-                      break
-              if visited >= 3000 or time.monotonic() > deadline:
-                  break
-          
-          def inside(p):
-              p = p.resolve()
-              return p if p.is_relative_to(app) and p.is_file() else None
-          
-          seen, used, matches, scanned = set(), 0, 0, 0
-          ordered = sorted(bundles, key=lambda p: (not bool(specific_rx.search(p.name)), str(p)))
-          for bundle in ordered[:24]:
-              if time.monotonic() > deadline or matches >= 160:
-                  break
-              plist = next((p for q in ("Contents/Info.plist", "Resources/Info.plist",
-                           "Versions/Current/Resources/Info.plist", "Info.plist")
-                           if (p := inside(bundle / q))), None)
-              if not plist:
+          build_info = plistlib.loads((app / "Contents/version.plist").read_bytes())
+          emit("xcode", path=str(app), version=info.get("CFBundleShortVersionString"),
+               build=build_info.get("ProductBuildVersion"))
+          targets = ["IDEIntelligenceModelService", "IDEIntelligenceFoundation", "IDEIntelligenceChat"]
+          total, matches = 0, 0
+          for name in targets:
+              path = (app / "Contents/PlugIns" / (name + ".framework") / "Versions/A" / name).resolve()
+              if not path.is_relative_to(app) or not path.is_file():
+                  emit("missing", component=name)
                   continue
+              if path.stat().st_size > 256 * 1024**2:
+                  emit("skip_size", component=name)
+                  continue
+              data = path.read_bytes()
+              total += len(data)
+              emit("binary", component=name, bytes=len(data), sha256=hashlib.sha256(data).hexdigest())
               try:
-                  meta = plistlib.loads(plist.read_bytes())
-              except (ValueError, OSError):
+                  sections = macho_sections(data)
+              except (ValueError, struct.error) as error:
+                  emit("parse_error", component=name, error=str(error))
                   continue
-              exe = meta.get("CFBundleExecutable", "")
-              emit("bundle", path=str(bundle.relative_to(app)), id=meta.get("CFBundleIdentifier"),
-                   version=meta.get("CFBundleShortVersionString"), executable=exe)
-              if not isinstance(exe, str) or not exe or "/" in exe or "\\" in exe:
-                  continue
-              targets = [bundle / "Contents/MacOS" / exe, bundle / exe,
-                         bundle / "Versions/Current" / exe, plist]
-              for raw in targets:
-                  if time.monotonic() > deadline or matches >= 160:
-                      break
-                  p = inside(raw)
-                  if not p or p in seen:
-                      continue
-                  seen.add(p)
-                  size = p.stat().st_size
-                  if not size or size > 256 * 1024**2 or used + size > 512 * 1024**2:
-                      emit("skip_budget", path=str(p.relative_to(app)), bytes=size)
-                      continue
-                  used += size
-                  scanned += 1
-                  with p.open("rb") as stream, mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
-                      found, limited = scan(data, deadline)
-                  ranked = sorted(found, key=lambda v: (not bool(signal_rx.search(v[1])),
-                                                        v[0] != "url", v[1]))
-                  for kind, value in ranked[:16]:
-                      if matches >= 160:
-                          break
-                      emit(kind, path=str(p.relative_to(app)), value=value)
+              emitted = 0
+              for segment, section, offset, length, address in sections:
+                  emit("section", component=name, name=segment + "," + section, bytes=length)
+                  payload = data[offset:offset + length]
+                  if section == "__ustring":
+                      chunks = [(m.start(), m.group().decode("utf-16le", errors="ignore"))
+                                for m in re.finditer(rb"(?:[\x20-\x7e]\x00){4,512}", payload)]
+                  else:
+                      chunks = [(m.start(), m.group().decode("utf-8", errors="replace"))
+                                for m in re.finditer(rb"[^\x00]{4,2048}", payload)]
+                  selected_indices = set()
+                  for i, (_, value) in enumerate(chunks):
+                      if signal.search(value) or public_id.fullmatch(value):
+                          selected_indices.update(range(max(0, i - 2), min(len(chunks), i + 3)))
+                  priority = re.compile(r"chatgpt|openai|floodgate|^app_|https?://", re.I)
+                  ordered = sorted(selected_indices, key=lambda i: (
+                      not bool(priority.search(chunks[i][1]) or public_id.fullmatch(chunks[i][1])),
+                      not bool(signal.search(chunks[i][1])), i))
+                  for i in ordered:
+                      relative, value = chunks[i]
+                      if len(value) > 700 or value.startswith(("$s", "_$s")):
+                          continue
+                      emit("constant", component=name, section=section,
+                           offset=hex(offset + relative), address=hex(address + relative),
+                           matched=bool(signal.search(value) or public_id.fullmatch(value)),
+                           value=safe_text(value))
+                      emitted += 1
                       matches += 1
-                  if limited or len(ranked) > 16:
-                      emit("file_truncated", path=str(p.relative_to(app)), candidates=len(ranked))
-          emit("coverage", bundles_found=len(bundles), files_scanned=scanned, bytes_scanned=used,
-               matches=matches, directories=visited, seconds=round(time.monotonic()-started, 1),
-               time_limit_reached=time.monotonic() > deadline,
-               directory_limit_reached=visited >= 3000, bundle_limit_reached=len(bundles) > 24,
-               output_limit_reached=matches >= 160)
+                      if emitted >= 400:
+                          break
+                  if emitted >= 400:
+                      emit("truncated", component=name, limit=400)
+                      break
+              resource_root = path.parent / "Resources"
+              if resource_root.is_dir():
+                  candidates = sorted(p.relative_to(resource_root).as_posix() for p in resource_root.rglob("*")
+                                      if p.is_file() and p.suffix in (".json", ".plist", ".yaml", ".js"))
+                  emit("resources", component=name, files=candidates[:60], truncated=len(candidates) > 60)
+          emit("coverage", binary_bytes=total, constants=matches, seconds=round(time.monotonic()-started, 1),
+               dynamic_auth_test=False)
           PY
