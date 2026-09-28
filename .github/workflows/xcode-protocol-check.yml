@@ -270,4 +270,116 @@ jobs:
                            emitted=min(len(ranked), 350), truncated=len(ranked) > 350)
                       break
           emit("cache_trace_complete", seconds=round(time.monotonic()-started, 1), dynamic_auth_test=False)
+          
+          # Read static metadata and selected disassembly; never load the target framework.
+          import tempfile
+          from collections import deque
+          
+          if tool.returncode == 0:
+              anvil_image = "/System/Library/PrivateFrameworks/Anvil.framework/Versions/A/Anvil"
+              dyld_tool = tool.stdout.strip()
+              export_run = subprocess.run([dyld_tool, "-uuid", "-exports", anvil_image],
+                                          capture_output=True, text=True, timeout=20)
+              export_uuid = uuid_rx.search(export_run.stdout)
+              emit("protocol_image", image=anvil_image, uuid=export_uuid.group() if export_uuid else None,
+                   returncode=export_run.returncode, diagnostics=safe_text(export_run.stderr[:1200]))
+              if export_run.returncode == 0 and export_uuid:
+                  symbols_run = subprocess.run(["/usr/bin/xcrun", "swift-demangle", "--compact"],
+                                               input=export_run.stdout, capture_output=True, text=True, timeout=20)
+                  if symbols_run.returncode:
+                      raise RuntimeError("Swift symbol demangling failed")
+                  symbol_rx = re.compile(r"clientID|clientIdentifier|appID|OAuth|AuthenticationService|"
+                                         r"ChatGPTXcode|Ticketing|RateLimiting|Session.*Request|"
+                                         r"Response.*Request|Request.*Response|ChatGPTConfiguration|"
+                                         r"HTTPRequest|HTTPClient", re.I)
+                  matches = [line for line in symbols_run.stdout.splitlines() if symbol_rx.search(line)]
+                  for line in matches[:260]:
+                      emit("protocol_symbol", value=safe_text(line))
+                  emit("protocol_symbol_coverage", candidates=len(matches), emitted=min(len(matches), 260),
+                       truncated=len(matches) > 260)
+          
+                  reflection_run = subprocess.run(
+                      [dyld_tool, "-section_bytes", "__TEXT", "__swift5_reflstr", anvil_image],
+                      capture_output=True, text=True, timeout=20)
+                  reflection = bytearray()
+                  previous_end = None
+                  gaps = 0
+                  for line in reflection_run.stdout.splitlines():
+                      match = re.fullmatch(r"0x([0-9a-fA-F]+): ((?:[0-9a-fA-F]{2} ?)+)", line.strip())
+                      if not match:
+                          continue
+                      address = int(match.group(1), 16)
+                      chunk = bytes.fromhex(match.group(2))
+                      if previous_end is not None and address != previous_end:
+                          reflection.append(0)
+                          gaps += 1
+                      reflection.extend(chunk)
+                      previous_end = address + len(chunk)
+                  fields = sorted(set(part.decode("utf-8", errors="replace") for part in reflection.split(b"\0")
+                                      if 1 <= len(part) <= 160))
+                  emit("protocol_reflection", returncode=reflection_run.returncode, bytes=len(reflection),
+                       address_gaps=gaps, fields=fields[:450], truncated=len(fields) > 450,
+                       diagnostics=safe_text(reflection_run.stderr[:1200]))
+          
+                  # Spool the full tool output only on the disposable runner; publish bounded excerpts.
+                  with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as raw_asm, \
+                          tempfile.TemporaryFile(mode="w+", encoding="utf-8") as demangled_asm:
+                      try:
+                          dis_run = subprocess.run([dyld_tool, "-disassemble", anvil_image],
+                                                   stdout=raw_asm, stderr=subprocess.PIPE, text=True, timeout=35)
+                          raw_size = raw_asm.tell()
+                          if raw_size > 96 * 1024**2:
+                              raise ValueError("Disassembly exceeds 96 MiB analysis limit")
+                          raw_asm.seek(0)
+                          demangle_run = subprocess.run(["/usr/bin/xcrun", "swift-demangle", "--compact"],
+                                                       stdin=raw_asm, stdout=demangled_asm,
+                                                       stderr=subprocess.PIPE, text=True, timeout=25)
+                          emit("protocol_disassembly", returncode=dis_run.returncode,
+                               demangle_returncode=demangle_run.returncode, bytes=raw_size,
+                               diagnostics=safe_text((dis_run.stderr + demangle_run.stderr)[:1200]))
+                          if dis_run.returncode or demangle_run.returncode:
+                              raise ValueError("Static disassembly or demangling failed")
+                          demangled_asm.seek(0)
+                          selected_rx = re.compile(r"(?:Configuration|Config|AuthenticationService).*"
+                                                   r"(?:clientID|clientIdentifier|appID|authorizationURL|authorizeURL)", re.I)
+                          xref_rx = re.compile(r"app_[A-Za-z0-9_-]{8,}|apple\.v1\.request|"
+                                               r"apple-chatgpt://|Overrides\.ChatGPTXcode")
+                          nearest_symbol = None
+                          selected = False
+                          function_lines = []
+                          function_size = 0
+                          emitted_functions = 0
+                          xrefs = 0
+                          context = deque(maxlen=5)
+          
+                          def flush_function():
+                              if selected:
+                                  emit("protocol_function", symbol=nearest_symbol, lines=function_lines,
+                                       total_lines=function_size, truncated=function_size > len(function_lines))
+          
+                          for raw_line in demangled_asm:
+                              line = raw_line.rstrip()
+                              if not line.startswith(("0x", " ", "\t")) and line.endswith(":"):
+                                  flush_function()
+                                  nearest_symbol = line[:-1]
+                                  selected = bool(selected_rx.search(nearest_symbol)) and emitted_functions < 18
+                                  if selected:
+                                      emitted_functions += 1
+                                  function_lines = []
+                                  function_size = 0
+                              elif line.startswith("0x"):
+                                  function_size += 1
+                                  if selected and len(function_lines) < 120:
+                                      function_lines.append(safe_text(line))
+                              if xref_rx.search(line) and xrefs < 30:
+                                  emit("protocol_xref", nearest_symbol=nearest_symbol,
+                                       context=list(context), value=safe_text(line))
+                                  xrefs += 1
+                              context.append(safe_text(line))
+                          flush_function()
+                          emit("protocol_disassembly_coverage", functions=emitted_functions, xrefs=xrefs,
+                               max_functions=18, max_lines_per_function=120, max_xrefs=30)
+                      except (subprocess.TimeoutExpired, ValueError) as error:
+                          emit("protocol_disassembly_error", error=str(error))
+          emit("protocol_trace_complete", seconds=round(time.monotonic()-started, 1), dynamic_auth_test=False)
           PY
