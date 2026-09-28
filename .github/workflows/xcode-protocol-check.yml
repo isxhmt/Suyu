@@ -230,4 +230,44 @@ jobs:
                       if count >= 100:
                           break
           emit("trace_complete", seconds=round(time.monotonic()-started, 1), dynamic_auth_test=False)
+          tool = subprocess.run(["/usr/bin/xcrun", "--find", "dyld_info"],
+                                capture_output=True, text=True, timeout=10)
+          emit("cache_tool", path=tool.stdout.strip(), returncode=tool.returncode)
+          cache_signal = re.compile(r"https?://|chatgpt|openai|oauth|apple-chatgpt|client.?id|"
+                                    r"authorize|authorization|private.?token|attest|device_secret|"
+                                    r"refresh_token|scope|audience|x-request|session[./]|xcode", re.I)
+          uuid_rx = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+          if tool.returncode == 0:
+              for name in ("Anvil", "GenerativePartnerService", "GenerativePartnerServiceUI"):
+                  for relative in (f"{name}.framework/Versions/A/{name}", f"{name}.framework/{name}"):
+                      image_path = "/System/Library/PrivateFrameworks/" + relative
+                      command = [tool.stdout.strip(), "-uuid", "-section", "__TEXT", "__cstring",
+                                 "-section", "__DATA_CONST", "__cfstring",
+                                 "-section", "__DATA", "__cfstring", image_path]
+                      try:
+                          result = subprocess.run(command, capture_output=True, text=True, timeout=20)
+                      except subprocess.TimeoutExpired:
+                          emit("cache_error", component=name, image=image_path, error="20 second timeout")
+                          continue
+                      lines = result.stdout.splitlines()
+                      found_uuid = uuid_rx.search(result.stdout)
+                      emit("cache_image", component=name, image=image_path, returncode=result.returncode,
+                           uuid=found_uuid.group() if found_uuid else None,
+                           header=[safe_text(v) for v in lines[:5]],
+                           diagnostics=safe_text(result.stderr[:1200]))
+                      if result.returncode or not found_uuid:
+                          continue
+                      indices = set()
+                      for i, line in enumerate(lines):
+                          if cache_signal.search(line) or re.search(r"\bapp_[A-Za-z0-9_-]{8,100}\b", line):
+                              indices.update(range(max(0, i - 1), min(len(lines), i + 2)))
+                      ranked = sorted(indices, key=lambda i: (
+                          not bool(re.search(r"https?://|apple-chatgpt|app_[A-Za-z0-9_-]{8,}|com.apple.openai", lines[i], re.I)),
+                          not bool(cache_signal.search(lines[i])), i))
+                      for i in ranked[:350]:
+                          emit("cache_constant", component=name, value=safe_text(lines[i]))
+                      emit("cache_coverage", component=name, lines=len(lines), candidates=len(ranked),
+                           emitted=min(len(ranked), 350), truncated=len(ranked) > 350)
+                      break
+          emit("cache_trace_complete", seconds=round(time.monotonic()-started, 1), dynamic_auth_test=False)
           PY
