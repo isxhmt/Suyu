@@ -386,8 +386,27 @@ jobs:
           # Resolve field ownership from Swift reflection records without executing code.
           if tool.returncode == 0:
               cache_segments = []
-              for section in ("__cstring", "__swift5_reflstr", "__swift5_typeref", "__swift5_types", "__swift5_fieldmd", "__const"):
-                  section_run = subprocess.run([dyld_tool, "-section_bytes", "__TEXT", section, anvil_image],
+              requested_names = {"__cstring", "__swift5_reflstr", "__swift5_typeref", "__swift5_types", "__swift5_fieldmd"}
+              segment_run = subprocess.run([dyld_tool, "-segments", anvil_image],
+                                           capture_output=True, text=True, timeout=20)
+              section_pairs = []
+              current_segment = None
+              for line in segment_run.stdout.splitlines():
+                  names = re.findall(r"__[A-Za-z0-9_]+", line)
+                  if len(names) != 1:
+                      continue
+                  if re.search(r"\d+KB\b", line):
+                      current_segment = names[0]
+                  elif current_segment and re.search(r"\s\d+\s*$", line):
+                      name = names[0]
+                      if name in requested_names or name.startswith("__const"):
+                          section_pairs.append((current_segment, name))
+              emit("field_section_map", returncode=segment_run.returncode, selected=section_pairs,
+                   diagnostics=safe_text(segment_run.stderr[:1000]))
+              if segment_run.returncode or not section_pairs or len(section_pairs) > 16:
+                  raise RuntimeError("Could not identify bounded Swift metadata sections")
+              for segment, section in section_pairs:
+                  section_run = subprocess.run([dyld_tool, "-section_bytes", segment, section, anvil_image],
                                                capture_output=True, text=True, timeout=20)
                   chunks = []
                   for line in section_run.stdout.splitlines():
@@ -400,7 +419,7 @@ jobs:
                       else:
                           chunks.append((address, bytearray(chunk)))
                   total = sum(len(data) for _, data in chunks)
-                  emit("field_section", section=section, returncode=section_run.returncode,
+                  emit("field_section", segment=segment, section=section, returncode=section_run.returncode,
                        bytes=total, chunks=len(chunks), diagnostics=safe_text(section_run.stderr[:1000]))
                   if section_run.returncode or total > 4 * 1024**2:
                       raise RuntimeError("Reflection section unavailable or too large")
@@ -437,7 +456,11 @@ jobs:
                       return name
                   if parent_value & 1:
                       return "<indirect-parent>." + str(name)
-                  return str(context_name(address + 4 + parent_value, depth + 1)) + "." + str(name)
+                  try:
+                      parent = context_name(address + 4 + parent_value, depth + 1)
+                  except (ValueError, TypeError):
+                      parent = "<unresolved-parent>"
+                  return str(parent) + "." + str(name)
           
               def reflected_type(address):
                   if address is None:
@@ -456,6 +479,7 @@ jobs:
               nominal_fields = {}
               indirect_type_records = 0
               unresolved_type_records = 0
+              unresolved_type_samples = []
               for base_address, data, section in cache_segments:
                   if section != "__swift5_types":
                       continue
@@ -472,10 +496,13 @@ jobs:
                               field_address = cache_rel(descriptor + 16)
                               if field_address is not None:
                                   nominal_fields[field_address] = context_name(descriptor)
-                      except (ValueError, TypeError):
+                      except (ValueError, TypeError) as error:
                           unresolved_type_records += 1
+                          if len(unresolved_type_samples) < 5:
+                              unresolved_type_samples.append({"descriptor": hex(descriptor), "reason": str(error)})
               emit("nominal_type_coverage", field_owners=len(nominal_fields),
-                   indirect_or_unsupported=indirect_type_records, unresolved=unresolved_type_records)
+                   indirect_or_unsupported=indirect_type_records, unresolved=unresolved_type_records,
+                   unresolved_samples=unresolved_type_samples)
           
               descriptors = []
               failures = []
