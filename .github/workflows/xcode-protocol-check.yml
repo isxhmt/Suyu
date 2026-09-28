@@ -382,4 +382,133 @@ jobs:
                       except (subprocess.TimeoutExpired, ValueError) as error:
                           emit("protocol_disassembly_error", error=str(error))
           emit("protocol_trace_complete", seconds=round(time.monotonic()-started, 1), dynamic_auth_test=False)
+          
+          # Resolve field ownership from Swift reflection records without executing code.
+          if tool.returncode == 0:
+              cache_segments = []
+              for section in ("__cstring", "__swift5_reflstr", "__swift5_typeref", "__swift5_types", "__swift5_fieldmd", "__const"):
+                  section_run = subprocess.run([dyld_tool, "-section_bytes", "__TEXT", section, anvil_image],
+                                               capture_output=True, text=True, timeout=20)
+                  chunks = []
+                  for line in section_run.stdout.splitlines():
+                      match = re.fullmatch(r"0x([0-9a-fA-F]+): ((?:[0-9a-fA-F]{2} ?)+)", line.strip())
+                      if not match:
+                          continue
+                      address, chunk = int(match.group(1), 16), bytes.fromhex(match.group(2))
+                      if chunks and chunks[-1][0] + len(chunks[-1][1]) == address:
+                          chunks[-1][1].extend(chunk)
+                      else:
+                          chunks.append((address, bytearray(chunk)))
+                  total = sum(len(data) for _, data in chunks)
+                  emit("field_section", section=section, returncode=section_run.returncode,
+                       bytes=total, chunks=len(chunks), diagnostics=safe_text(section_run.stderr[:1000]))
+                  if section_run.returncode or total > 4 * 1024**2:
+                      raise RuntimeError("Reflection section unavailable or too large")
+                  cache_segments.extend((address, bytes(data), section) for address, data in chunks)
+          
+              def cache_read(address, length):
+                  for start, data, _ in cache_segments:
+                      offset = address - start
+                      if 0 <= offset and offset + length <= len(data):
+                          return data[offset:offset + length]
+                  raise ValueError("Address outside inspected sections: " + hex(address))
+          
+              def cache_rel(address):
+                  value = struct.unpack("<i", cache_read(address, 4))[0]
+                  return address + value if value else None
+          
+              def cache_string(address):
+                  if address is None:
+                      return None
+                  for start, data, _ in cache_segments:
+                      offset = address - start
+                      if 0 <= offset < len(data):
+                          return data[offset:offset + 512].split(b"\0", 1)[0].decode("utf-8", errors="replace")
+                  raise ValueError("String outside inspected sections: " + hex(address))
+          
+              def context_name(address, depth=0):
+                  if depth > 8:
+                      return "<context-depth-limit>"
+                  flags = struct.unpack("<I", cache_read(address, 4))[0]
+                  kind = flags & 31
+                  name = cache_string(cache_rel(address + 8)) if kind in (0, 3, 16, 17, 18) else "<context-kind-%d>" % kind
+                  parent_value = struct.unpack("<i", cache_read(address + 4, 4))[0]
+                  if not parent_value:
+                      return name
+                  if parent_value & 1:
+                      return "<indirect-parent>." + str(name)
+                  return str(context_name(address + 4 + parent_value, depth + 1)) + "." + str(name)
+          
+              def reflected_type(address):
+                  if address is None:
+                      return None
+                  try:
+                      prefix = cache_read(address, 1)[0]
+                      if prefix == 1:
+                          return context_name(cache_rel(address + 1))
+                      if prefix == 2:
+                          return "<indirect-symbolic-reference@%s>" % hex(address)
+                      value = cache_string(address)
+                      return value if all(ord(c) >= 32 for c in value) else "<symbolic-type@%s>" % hex(address)
+                  except (ValueError, TypeError):
+                      return "<unresolved-type@%s>" % hex(address)
+          
+              nominal_fields = {}
+              indirect_type_records = 0
+              unresolved_type_records = 0
+              for base_address, data, section in cache_segments:
+                  if section != "__swift5_types":
+                      continue
+                  for offset in range(0, len(data) - 3, 4):
+                      value = struct.unpack_from("<i", data, offset)[0]
+                      # TypeReferenceKind occupies two low bits; indirect forms are not guessed.
+                      if value & 3:
+                          indirect_type_records += 1
+                          continue
+                      descriptor = base_address + offset + value
+                      try:
+                          kind = struct.unpack("<I", cache_read(descriptor, 4))[0] & 31
+                          if kind in (16, 17, 18):
+                              field_address = cache_rel(descriptor + 16)
+                              if field_address is not None:
+                                  nominal_fields[field_address] = context_name(descriptor)
+                      except (ValueError, TypeError):
+                          unresolved_type_records += 1
+              emit("nominal_type_coverage", field_owners=len(nominal_fields),
+                   indirect_or_unsupported=indirect_type_records, unresolved=unresolved_type_records)
+          
+              descriptors = []
+              failures = []
+              for base_address, data, section in cache_segments:
+                  if section != "__swift5_fieldmd":
+                      continue
+                  offset = 0
+                  while offset + 16 <= len(data):
+                      address = base_address + offset
+                      _, _, kind, record_size, count = struct.unpack_from("<iiHHI", data, offset)
+                      if record_size != 12 or count > 512 or offset + 16 + count * record_size > len(data):
+                          failures.append({"address": hex(address), "reason": "Invalid field descriptor bounds"})
+                          break
+                      fields = []
+                      try:
+                          name = nominal_fields.get(address) or reflected_type(cache_rel(address))
+                          for index in range(count):
+                              record = address + 16 + index * record_size
+                              fields.append({"index": index, "name": cache_string(cache_rel(record + 8)),
+                                             "flags": struct.unpack("<I", cache_read(record, 4))[0]})
+                          descriptors.append({"address": hex(address), "type": name, "descriptor_kind": kind,
+                                              "fields": fields})
+                      except ValueError as error:
+                          failures.append({"address": hex(address), "reason": str(error)})
+                      offset += 16 + count * record_size
+              relevant = [item for item in descriptors if re.search(
+                  r"ChatGPTProvider|ChatGPTXcode|OpenAIAuthentication|ResponseConfiguration|"
+                  r"fraudTicketingEnabled|rateLimitingEnabled|defaultEnvironmentAppIDs|"
+                  r"codeVerifier|toolCallOutputs|clientTools", json.dumps(item), re.I)]
+              for item in relevant[:50]:
+                  emit("field_descriptor", **item)
+              emit("field_descriptor_coverage", total=len(descriptors), candidates=len(relevant),
+                   emitted=min(len(relevant), 50), truncated=len(relevant) > 50, errors=failures[:10],
+                   error_count=len(failures), field_order_is_not_runtime_byte_offset=True)
+          emit("field_trace_complete", seconds=round(time.monotonic()-started, 1), dynamic_auth_test=False)
           PY
