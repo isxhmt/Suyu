@@ -164,4 +164,70 @@ jobs:
                   emit("resources", component=name, files=candidates[:60], truncated=len(candidates) > 60)
           emit("coverage", binary_bytes=total, constants=matches, seconds=round(time.monotonic()-started, 1),
                dynamic_auth_test=False)
+          symbol_rx = re.compile(r"BuiltInChatGPT|GenerativePartner|ExternalAI|xcodeClientID|"
+                                 r"builtInClaude|chatgptGMSIdentifier|ModelBundle|getCredentialedURL", re.I)
+          for name in ("IDEIntelligenceModelService", "IDEIntelligenceChat"):
+              path = app / "Contents/PlugIns" / (name + ".framework") / "Versions/A" / name
+              symbols = subprocess.run(["/usr/bin/xcrun", "nm", "-arch", "arm64", "-j", str(path)],
+                                       capture_output=True, text=True, timeout=20)
+              if symbols.returncode:
+                  emit("symbol_error", component=name, returncode=symbols.returncode)
+                  continue
+              chosen = sorted({s for s in symbols.stdout.splitlines() if symbol_rx.search(s)})
+              decoded = subprocess.run(["/usr/bin/xcrun", "swift-demangle", "--compact"],
+                                       input="\n".join(chosen[:220]), capture_output=True, text=True, timeout=15)
+              for value in decoded.stdout.splitlines():
+                  emit("symbol", component=name, value=value[:900])
+              emit("symbol_coverage", component=name, matched=len(chosen), emitted=min(len(chosen), 220))
+              dependencies = subprocess.run(["/usr/bin/otool", "-L", str(path)],
+                                            capture_output=True, text=True, timeout=10)
+              for value in dependencies.stdout.splitlines():
+                  if re.search(r"Generative|Partner|Authentication|ModelService|Anvil", value, re.I):
+                      emit("dependency", component=name, value=value.strip())
+          
+          for relative in ("Contents/PlugIns/IDEIntelligenceChat.framework/Versions/A/Resources/ApprovedIntegrationModelPairings.plist",
+                           "Contents/PlugIns/IDEIntelligenceChat.framework/Versions/A/Resources/OnboardingIntelligenceXcode.bundle/Contents/Resources/IntelligenceInXcode.plist"):
+              path = app / relative
+              if path.is_file() and path.stat().st_size < 128 * 1024:
+                  value = plistlib.loads(path.read_bytes())
+                  emit("resource_metadata", path=relative, value=json.dumps(value, default=str)[:12000])
+          
+          system = pathlib.Path("/System/Library")
+          for relative in ("PrivateFrameworks", "ExtensionKit/Extensions", "Frameworks"):
+              directory = system / relative
+              if not directory.is_dir():
+                  continue
+              for bundle in sorted(directory.iterdir()):
+                  if not re.search(r"ChatGPT|OpenAI|GenerativePartner|ExternalAI|GenerativeAssistant|Anvil", bundle.name, re.I):
+                      continue
+                  plist = next((p for p in (bundle / "Contents/Info.plist", bundle / "Resources/Info.plist")
+                                if p.is_file()), None)
+                  meta = plistlib.loads(plist.read_bytes()) if plist else {}
+                  exe = meta.get("CFBundleExecutable") or bundle.stem
+                  candidates = [bundle / "Contents/MacOS" / exe, bundle / exe, bundle / "Versions/A" / exe]
+                  binary = next((p for p in candidates if p.is_file()), None)
+                  emit("system_component", path=str(bundle), bundle_id=meta.get("CFBundleIdentifier"),
+                       executable_present=bool(binary), binary=str(binary) if binary else None)
+                  if not binary or binary.stat().st_size > 64 * 1024**2:
+                      continue
+                  data = binary.read_bytes()
+                  try:
+                      sections = macho_sections(data)
+                  except (ValueError, struct.error):
+                      continue
+                  count = 0
+                  for segment, section, offset, length, address in sections:
+                      if section != "__cstring":
+                          continue
+                      for item in re.finditer(rb"[^\x00]{4,2048}", data[offset:offset + length]):
+                          value = item.group().decode("utf-8", errors="replace")
+                          if re.search(r"https?://|chatgpt|openai|oauth|apple-chatgpt|client.?id|attest", value, re.I):
+                              emit("system_constant", component=bundle.name, offset=hex(offset + item.start()),
+                                   value=safe_text(value))
+                              count += 1
+                              if count >= 100:
+                                  break
+                      if count >= 100:
+                          break
+          emit("trace_complete", seconds=round(time.monotonic()-started, 1), dynamic_auth_test=False)
           PY
